@@ -67,9 +67,9 @@ if [[ -n "${IMPORTED_IMAGE_NAME}" ]]; then
 fi
 
 #cleanup built sig image if the generated sig is for production only, but not for test purpose.
-#For Gen 2, it follows the sigMode. If SIG_FOR_PRODUCTION is set to true, the sig has been converted to VHD before this step.
+#If SIG_FOR_PRODUCTION is set to true, the sig has been converted to VHD before this step.
 #And since we only need to upload the converted VHD to the classic storage account, there's no need to keep the built sig.
-if [[ "$GEN2_SIG_FOR_PRODUCTION" == "True" ]]; then
+if [[ "$SIG_FOR_PRODUCTION" == "True" ]]; then
   if [[ -n "${SIG_IMAGE_NAME}" ]]; then
     # Delete sig image version first
     echo "SIG_IMAGE_NAME is ${SIG_IMAGE_NAME}, deleting sig image version first"
@@ -181,7 +181,60 @@ if [[ -n "${AZURE_RESOURCE_GROUP_NAME}" && "${DRY_RUN,,}" == "false" ]]; then
   set -x
 fi
 
-#clean up storage account created over a week ago
+# attempt to clean up Windows managed images and SIG image versions created over a week ago in SIG_GALLERY_NAME (except the production gallery)
+# [TO-DO]: run while not in dry-run mode
+if [[ -n "${AZURE_RESOURCE_GROUP_NAME}" && "${DRY_RUN}" == "True" && "${SIG_GALLERY_NAME}" != "AKSWindows" ]]; then
+  echo "Looking for Windows managed images in ${AZURE_RESOURCE_GROUP_NAME} created over ${EXPIRATION_IN_HOURS} hours ago..."
+
+  managed_image_ids=""
+  sig_version_ids=""
+
+  # delete outdated Windows managed images and associated SIG versions (.tags.os must be "Windows")
+  images=$(az image list -g ${AZURE_RESOURCE_GROUP_NAME} | jq --arg dl $deadline '.[] | select(.tags.os == "Windows") | select(.tags.now < $dl).name' | tr -d '\"' || "")
+  for image in $images; do
+    managed_image_ids="${managed_image_ids} /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${AZURE_RESOURCE_GROUP_NAME}/providers/Microsoft.Compute/images/${image}"
+    sig_version_ids="${sig_version_ids} /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${AZURE_RESOURCE_GROUP_NAME}/providers/Microsoft.Compute/galleries/${SIG_GALLERY_NAME}/images/${image%-*}/versions/${image#*-}"
+    echo "Will delete Windows managed image ${image} and associated SIG version from resource group ${AZURE_RESOURCE_GROUP_NAME}"
+  done
+
+  if [[ -n "${managed_image_ids}" ]]; then
+    echo "Attempting to delete $(echo ${managed_image_ids} | wc -w) Windows managed images..."
+    # az resource delete --ids ${managed_image_ids} > /dev/null || echo "Windows managed image deletion was not successful, continuing..."
+  else
+    echo "Did not find any Windows managed images eligible for deletion"
+  fi
+
+  if [[ -n "${sig_version_ids}" ]]; then
+    echo "Attempting to delete $(echo ${sig_version_ids} | wc -w) Windows SIG image versions associated with old managed images..."
+    # az resource delete --ids ${sig_version_ids} > /dev/null || echo "Windows SIG image version deletion was not successful, continuing..."
+  else
+    echo "Did not find any SIG versions associated with old Windows managed images eligible for deletion"
+  fi
+fi
+
+# attempt to clean up Windows SIG image versions in all galleries except "AKSWindows" created over a week ago
+# [TO-DO]: run while not in dry-run mode
+if [[ -n "${AZURE_RESOURCE_GROUP_NAME}" && "${DRY_RUN}" == "True" ]]; then
+  gallery_lists=$(az sig list -g ${AZURE_RESOURCE_GROUP_NAME} | jq '.[].name' | tr -d '\"' || "")
+  for gallery in $gallery_lists; do
+    if [[ $gallery == "AKSWindows" ]]; then
+        continue
+    fi
+
+    # delete old Windows SIG image versions in gallery (image definitions must have .osType == "Windows")
+    image_defs=$(az sig image-definition list -g ${AZURE_RESOURCE_GROUP_NAME} -r ${gallery} | jq '.[] .name' | tr -d '\"' || "")
+    for image_definition in $(az sig image-definition list -g ${AZURE_RESOURCE_GROUP_NAME} -r ${gallery} | jq '.[] | select(.osType == "Windows").name' | tr -d '\"' || ""); do
+        echo "Finding sig image versions associated with ${image_definition} in gallery ${gallery}"
+        for image_version in $(az sig image-version list -g ${AZURE_RESOURCE_GROUP_NAME} -r ${gallery} -i ${image_definition} | jq --arg dl $deadline '.[] | select(.tags.now < $dl).name' | tr -d '\"' || ""); do
+            az sig image-version show -e $image_version -i ${image_definition} -r ${gallery} -g ${AZURE_RESOURCE_GROUP_NAME} | jq .id
+            echo "Deleting sig image-version ${image_version} ${image_definition} from gallery ${gallery} rg ${AZURE_RESOURCE_GROUP_NAME}"
+            # az sig image-version delete -e $image_version -i ${image_definition} -r ${gallery} -g ${AZURE_RESOURCE_GROUP_NAME}
+        done
+    done
+  done
+fi
+
+# clean up storage account created over a week ago
 if [[ -n "${AZURE_RESOURCE_GROUP_NAME}" && "${DRY_RUN}" == "False" ]]; then
   echo "Looking for storage accounts in ${AZURE_RESOURCE_GROUP_NAME} created over ${EXPIRATION_IN_HOURS} hours ago..."
   echo "That is, those created before $(date -d@$deadline) As shown below"
@@ -192,5 +245,24 @@ if [[ -n "${AZURE_RESOURCE_GROUP_NAME}" && "${DRY_RUN}" == "False" ]]; then
           az storage account delete --name ${storage_account} -g ${AZURE_RESOURCE_GROUP_NAME} --yes  || echo "unable to delete storage account ${storage_account}, will continue..."
           echo "Deletion completed"
       fi
+  done
+fi
+
+# clean up old packer and vnet resource groups created over a week ago that didn't get cleaned in the building vhd step in case the pipeline fails
+# [TO-DO]: run while not in dry-run mode
+if [[ -n "${AZURE_RESOURCE_GROUP_NAME}" && "${DRY_RUN}" == "True" ]]; then
+  pkr_groups=$(az group list | jq --arg dl $deadline '.[] | select(.name | test("pkr-Resource-Group*")) | select(.tags.now < $dl).name' | tr -d '\"' || "")
+  for pkr_group in $pkr_groups; do
+      echo "Deleting packer resource group $pkr_group"
+      # az group delete --name ${pkr_group} --yes 
+      echo "Deleted packer resource group $pkr_group"
+  done
+
+  # the old vnet groups do not have "now" in tags
+  vnet_groups=$(az group list | jq --arg dl $deadline '.[] | select(.name | test("vnet-*")) | select(.tags.now != null) | select(.tags.now < $dl).name' | tr -d '\"' || "")
+  for vnet_group in $vnet_groups; do
+      echo "Deleting vnet resource group $vnet_group"
+      # az group delete --name ${vnet_group} --yes 
+      echo "Deleted vnet resource group $vnet_group"
   done
 fi

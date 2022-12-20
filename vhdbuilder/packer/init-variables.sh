@@ -43,7 +43,7 @@ if [ -n "${VNET_RESOURCE_GROUP_NAME}" ]; then
 
 	echo "creating resource group ${VNET_RESOURCE_GROUP_NAME}, location ${AZURE_LOCATION} for VNET"
 	az group create --name ${VNET_RESOURCE_GROUP_NAME} --location ${AZURE_LOCATION} \
-		--tags 'os=Windows' 'createdBy=aks-vhd-pipeline' 'SkipASMAzSecPack=True'
+		--tags 'os=Windows' 'createdBy=aks-vhd-pipeline' 'SkipASMAzSecPack=True' 'now=${CREATE_TIME}'
 
 	echo "creating new network security group ${NETWORK_SECURITY_GROUP_NAME}"
 	az network nsg create --name $NETWORK_SECURITY_GROUP_NAME --resource-group ${VNET_RESOURCE_GROUP_NAME} --location ${AZURE_LOCATION} \
@@ -141,8 +141,8 @@ fi
 
 echo "Using finalized SIG_IMAGE_NAME: ${SIG_IMAGE_NAME}, SIG_GALLERY_NAME: ${SIG_GALLERY_NAME}"
 
-# If we're building a Linux VHD or we're building a windows VHD in sigMode, ensure SIG resources
-if [[ "$MODE" == "linuxVhdMode" || "$MODE" == "sigMode" ]]; then
+# If we're building a Linux VHD or we're building a windows VHD in windowsVhdMode, ensure SIG resources
+if [[ "$MODE" == "linuxVhdMode" || "$MODE" == "windowsVhdMode" ]]; then
 	echo "SIG existence checking for $MODE"
 	id=$(az sig show --resource-group ${AZURE_RESOURCE_GROUP_NAME} --gallery-name ${SIG_GALLERY_NAME}) || id=""
 	if [ -z "$id" ]; then
@@ -315,11 +315,15 @@ if [ "$OS_TYPE" == "Windows" ]; then
 	windows_sigmode_source_image_name=""
 	windows_sigmode_source_image_version=""
 
-	# Set the base image url if the pipeline variable is set
+	# default: build VHD images from a marketplace base image
+	IMPORTED_IMAGE_NAME=$imported_windows_image_name
+	IMPORTED_IMAGE_URL="https://${STORAGE_ACCOUNT_NAME}.blob.core.windows.net/system/$IMPORTED_IMAGE_NAME.vhd"
+
+	# build from a pre-supplied VHD blob a.k.a. external raw VHD
 	if [ -n "${WINDOWS_BASE_IMAGE_URL}" ]; then
 		echo "WINDOWS_BASE_IMAGE_URL is set in pipeline variables"
 
-		WINDOWS_IMAGE_URL="https://${STORAGE_ACCOUNT_NAME}.blob.core.windows.net/system/${imported_windows_image_name}.vhd"
+		WINDOWS_IMAGE_URL=${IMPORTED_IMAGE_URL}
 
 		echo "Generating sas token to copy Windows base image"
 		expiry_date=$(date -u -d "20 minutes" '+%Y-%m-%dT%H:%MZ')
@@ -334,18 +338,18 @@ if [ "$OS_TYPE" == "Windows" ]; then
 		WINDOWS_IMAGE_VERSION=""
 
 		# Need to use a sig image to create the build VM
-		if [[ "$MODE" == "sigMode" ]]; then
-			# Reuse IMPORTED_IMAGE_NAME so the shared code in cleanup.sh can delete the temporary resource
-			IMPORTED_IMAGE_NAME=$imported_windows_image_name
-			echo "Creating new image for imported vhd ${WINDOWS_IMAGE_URL}"
+		if [[ "$MODE" == "windowsVhdMode" ]]; then
+			# a. create a new managed image $IMPORTED_IMAGE_NAME from os disk source $IMPORTED_IMAGE_URL
+			echo "Creating new image for imported vhd ${IMPORTED_IMAGE_URL}"
 			az image create \
 				--resource-group $AZURE_RESOURCE_GROUP_NAME \
 				--name $IMPORTED_IMAGE_NAME \
-				--source $WINDOWS_IMAGE_URL \
+				--source ${IMPORTED_IMAGE_URL} \
 				--location $AZURE_LOCATION \
 				--hyper-v-generation $HYPERV_GENERATION \
 				--os-type ${OS_TYPE}
-			
+
+			# b. create a gallery image definition $IMPORTED_IMAGE_NAME	
 			echo "Creating new image-definition for imported image ${IMPORTED_IMAGE_NAME}"
 			# Need to specifiy hyper-v-generation to support Gen 2
 			az sig image-definition create \
@@ -361,6 +365,7 @@ if [ "$OS_TYPE" == "Windows" ]; then
 				--os-state generalized \
 				--description "Imported image for AKS Packer build"
 			
+			# c. create a image version defaulting to 1.0.0 for $IMPORTED_IMAGE_NAME
 			echo "Creating new image-version for imported image ${IMPORTED_IMAGE_NAME}"
 			az sig image-version create \
 				--location $AZURE_LOCATION \
@@ -370,7 +375,7 @@ if [ "$OS_TYPE" == "Windows" ]; then
 				--gallery-image-version 1.0.0 \
 				--managed-image $IMPORTED_IMAGE_NAME
 
-			# Use imported sig image to create the build VM
+			# d. Use imported sig image to create the build VM
 			WINDOWS_IMAGE_URL=""
 			windows_sigmode_source_subscription_id=$SUBSCRIPTION_ID
 			windows_sigmode_source_resource_group_name=$AZURE_RESOURCE_GROUP_NAME
